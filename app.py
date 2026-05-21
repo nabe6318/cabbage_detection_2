@@ -251,6 +251,154 @@ def split_and_detect(img_path, model, tile_w, tile_h, conf, imgsz, black_thresh,
 
 
 # =========================
+# Helper: IQR outlier filter UI
+# =========================
+def box_size_analysis_with_outlier_filter(df_boxes: pd.DataFrame, key_prefix: str = ""):
+    """
+    Render the full box size analysis section with IQR-based outlier removal.
+    key_prefix: unique string to avoid duplicate widget keys across modes.
+    """
+    areas = df_boxes["box_area"]
+
+    # ── IQR upper bound ───────────────────────────────────────
+    q1        = float(areas.quantile(0.25))
+    q3        = float(areas.quantile(0.75))
+    iqr       = q3 - q1
+    iqr_upper = q3 + 1.5 * iqr
+
+    st.markdown("#### 🔍 Outlier filter — upper bound")
+    st.caption(
+        "Abnormally large boxes (merged detections, background noise, etc.) "
+        "can distort the histogram. "
+        "The IQR threshold (Q3 + 1.5 × IQR) is set automatically. "
+        "Adjust the slider if needed."
+    )
+
+    col_sl, col_info = st.columns([3, 1])
+    with col_sl:
+        max_area = st.slider(
+            "Maximum box area (px²) — boxes above this are excluded as outliers",
+            min_value=int(areas.min()),
+            max_value=int(areas.max()),
+            value=min(int(iqr_upper), int(areas.max())),
+            step=100,
+            key=f"{key_prefix}_max_area",
+        )
+    with col_info:
+        st.markdown(
+            f"""
+            <div style='background:#fff8e1;border:1px solid #ffb300;
+                        border-radius:6px;padding:10px 12px;font-size:0.8rem;'>
+            <b>Auto IQR</b><br>
+            Q1 = {q1:,.0f}<br>
+            Q3 = {q3:,.0f}<br>
+            IQR = {iqr:,.0f}<br>
+            <b>Limit = {iqr_upper:,.0f} px²</b>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    df_filtered = df_boxes[df_boxes["box_area"] <= max_area].copy()
+    df_outliers = df_boxes[df_boxes["box_area"] >  max_area].copy()
+    n_outliers  = len(df_outliers)
+    areas_f     = df_filtered["box_area"]
+
+    if n_outliers > 0:
+        st.warning(
+            f"⚠️ **{n_outliers} box(es) excluded** "
+            f"(area > {max_area:,} px²). "
+            "Statistics and histogram use the filtered data only."
+        )
+    else:
+        st.success("✅ No outliers detected at the current threshold.")
+
+    # ── Statistics ────────────────────────────────────────────
+    st.markdown("**Box area statistics (filtered, px²)**")
+    if len(areas_f) == 0:
+        st.warning("No boxes remain. Try raising the maximum area threshold.")
+        return df_filtered
+
+    stats = areas_f.describe()
+    s1, s2, s3, s4, s5 = st.columns(5)
+    s1.metric("Count",  int(stats["count"]))
+    s2.metric("Mean",   f"{stats['mean']:.0f}")
+    s3.metric("Median", f"{areas_f.median():.0f}")
+    s4.metric("Min",    f"{stats['min']:.0f}")
+    s5.metric("Max",    f"{stats['max']:.0f}")
+
+    # ── Histogram: box area ───────────────────────────────────
+    fig_h, ax_h = plt.subplots(figsize=(7, 4))
+    ax_h.hist(areas_f, bins=30, alpha=0.85, color="#4CAF50", edgecolor="white",
+              label="Filtered boxes")
+    ax_h.axvline(float(areas_f.median()), color="#E53935", linestyle="--",
+                 linewidth=1.5, label=f"Median: {areas_f.median():.0f}")
+    ax_h.axvline(float(areas_f.mean()), color="#1565C0", linestyle=":",
+                 linewidth=1.5, label=f"Mean: {areas_f.mean():.0f}")
+    ax_h.set_xlabel("Box area (px²)")
+    ax_h.set_ylabel("Frequency")
+    ax_h.set_title(
+        f"Box area distribution"
+        + (f"  ({n_outliers} outlier(s) removed)" if n_outliers > 0 else "")
+    )
+    ax_h.legend()
+    fig_h.tight_layout()
+    st.pyplot(fig_h)
+    plt.close(fig_h)
+
+    # ── Histogram: width & height ─────────────────────────────
+    fig_s, ax_s = plt.subplots(figsize=(7, 4))
+    ax_s.hist(df_filtered["box_w"], bins=25, alpha=0.7, edgecolor="white", label="Width")
+    ax_s.hist(df_filtered["box_h"], bins=25, alpha=0.7, edgecolor="white", label="Height")
+    ax_s.set_xlabel("Size (px)")
+    ax_s.set_ylabel("Frequency")
+    ax_s.set_title("Box width & height distribution (filtered)")
+    ax_s.legend()
+    fig_s.tight_layout()
+    st.pyplot(fig_s)
+    plt.close(fig_s)
+
+    # ── Harvest-ready filter ──────────────────────────────────
+    st.markdown("**Filter by minimum box area**")
+    min_area = st.slider(
+        "Minimum box area (px²) — boxes below this are considered immature",
+        min_value=0,
+        max_value=int(areas_f.max()),
+        value=int(areas_f.quantile(0.25)),
+        step=100,
+        key=f"{key_prefix}_min_area",
+    )
+    harvest_ready = df_filtered[df_filtered["box_area"] >= min_area]
+    immature      = df_filtered[df_filtered["box_area"] <  min_area]
+    hr1, hr2, hr3 = st.columns(3)
+    hr1.metric("🥬 Harvest-ready", len(harvest_ready))
+    hr2.metric("🌱 Immature / small", len(immature))
+    hr3.metric("Harvest ratio", f"{len(harvest_ready) / len(df_filtered) * 100:.1f}%")
+
+    with st.expander("View all box details"):
+        df_disp = df_filtered.copy()
+        df_disp["harvest_ready"]     = df_disp["box_area"] >= min_area
+        df_disp["outlier_excluded"]  = False
+        if n_outliers > 0:
+            df_out = df_outliers.copy()
+            df_out["harvest_ready"]    = False
+            df_out["outlier_excluded"] = True
+            df_disp = pd.concat([df_disp, df_out])
+        st.dataframe(df_disp, use_container_width=True)
+
+    csv_boxes = df_filtered.to_csv(index=False).encode("utf-8-sig")
+    st.download_button(
+        "📥 Download box details CSV",
+        data=csv_boxes,
+        file_name="cabbage_box_details_filtered.csv",
+        mime="text/csv",
+        key=f"{key_prefix}_dl",
+    )
+
+    return df_filtered
+
+
+# =========================
 # Mode selection
 # =========================
 st.subheader("1️⃣ Analysis mode")
@@ -283,27 +431,27 @@ if mode == "Single area":
                 conf_thres, imgsz, black_threshold, box_thickness,
             )
 
-        st.session_state["single_annotated"] = annotated
-        st.session_state["single_tile_results"] = tile_results
-        st.session_state["single_grid_shape"] = grid_shape
-        st.session_state["single_box_details"] = box_details
+        st.session_state["single_annotated"]     = annotated
+        st.session_state["single_tile_results"]  = tile_results
+        st.session_state["single_grid_shape"]    = grid_shape
+        st.session_state["single_box_details"]   = box_details
         st.session_state["single_selected_file"] = selected_file
 
     if (
         "single_annotated" in st.session_state
         and st.session_state["single_selected_file"] == selected_file
     ):
-        annotated = st.session_state["single_annotated"]
+        annotated    = st.session_state["single_annotated"]
         tile_results = st.session_state["single_tile_results"]
-        grid_shape = st.session_state["single_grid_shape"]
-        box_details = st.session_state["single_box_details"]
+        grid_shape   = st.session_state["single_grid_shape"]
+        box_details  = st.session_state["single_box_details"]
 
         df_tiles = pd.DataFrame(tile_results)
         df_boxes = pd.DataFrame(box_details) if box_details else pd.DataFrame()
 
         total_count = int(df_tiles["count"].sum())
-        skipped = int(df_tiles["skipped"].sum())
-        processed = int(len(df_tiles) - skipped)
+        skipped     = int(df_tiles["skipped"].sum())
+        processed   = int(len(df_tiles) - skipped)
 
         st.subheader("2️⃣ Detection results")
 
@@ -329,65 +477,7 @@ if mode == "Single area":
                 "**not yet ready for harvest**. "
                 "Use the statistics below to identify an appropriate size threshold."
             )
-            st.markdown("**Box area statistics (px²)**")
-            stats = df_boxes["box_area"].describe()
-            s1, s2, s3, s4, s5 = st.columns(5)
-            s1.metric("Count", int(stats["count"]))
-            s2.metric("Mean", f"{stats['mean']:.0f}")
-            s3.metric("Median", f"{df_boxes['box_area'].median():.0f}")
-            s4.metric("Min", f"{stats['min']:.0f}")
-            s5.metric("Max", f"{stats['max']:.0f}")
-
-            fig_h, ax_h1 = plt.subplots(figsize=(7, 4))
-            ax_h1.hist(df_boxes["box_area"], bins=30, alpha=0.8, edgecolor="white")
-            ax_h1.axvline(df_boxes["box_area"].median(), linestyle="--",
-                          label=f"Median: {df_boxes['box_area'].median():.0f}")
-            ax_h1.set_xlabel("Box area (px²)")
-            ax_h1.set_ylabel("Frequency")
-            ax_h1.set_title("Box area distribution")
-            ax_h1.legend()
-            fig_h.tight_layout()
-            st.pyplot(fig_h)
-            plt.close(fig_h)
-
-            fig_s, ax_s = plt.subplots(figsize=(7, 4))
-            ax_s.hist(df_boxes["box_w"], bins=25, alpha=0.7, edgecolor="white", label="Width")
-            ax_s.hist(df_boxes["box_h"], bins=25, alpha=0.7, edgecolor="white", label="Height")
-            ax_s.set_xlabel("Size (px)")
-            ax_s.set_ylabel("Frequency")
-            ax_s.set_title("Box width & height distribution")
-            ax_s.legend()
-            fig_s.tight_layout()
-            st.pyplot(fig_s)
-            plt.close(fig_s)
-
-            st.markdown("**Filter by minimum box area**")
-            min_area = st.slider(
-                "Minimum box area (px²) — boxes below this are considered immature",
-                min_value=0,
-                max_value=int(df_boxes["box_area"].max()),
-                value=int(df_boxes["box_area"].quantile(0.25)),
-                step=100,
-            )
-            harvest_ready = df_boxes[df_boxes["box_area"] >= min_area]
-            immature = df_boxes[df_boxes["box_area"] < min_area]
-            hr1, hr2, hr3 = st.columns(3)
-            hr1.metric("🥬 Harvest-ready", len(harvest_ready))
-            hr2.metric("🌱 Immature / small", len(immature))
-            hr3.metric("Harvest ratio", f"{len(harvest_ready) / len(df_boxes) * 100:.1f}%")
-
-            with st.expander("View all box details"):
-                df_boxes_display = df_boxes.copy()
-                df_boxes_display["harvest_ready"] = df_boxes_display["box_area"] >= min_area
-                st.dataframe(df_boxes_display, use_container_width=True)
-
-            csv_boxes = df_boxes.to_csv(index=False).encode("utf-8-sig")
-            st.download_button(
-                "📥 Download box details CSV",
-                data=csv_boxes,
-                file_name="cabbage_box_details.csv",
-                mime="text/csv",
-            )
+            box_size_analysis_with_outlier_filter(df_boxes, key_prefix="single")
 
         st.subheader("3️⃣ Tile heatmap")
         rows, cols = grid_shape
@@ -429,6 +519,7 @@ else:
 
     if st.button("🚀 Run detection on all areas", use_container_width=True):
         all_results = []
+        all_box_details = []
         progress = st.progress(0, text="Processing...")
 
         for idx, fpath in enumerate(image_files):
@@ -455,8 +546,19 @@ else:
                 "tiles_skipped": int(df_tiles["skipped"].sum()),
             })
 
+            # Collect all box details with area label
+            for bd in box_details:
+                bd["fid"] = fid
+                bd["filename"] = fname
+            all_box_details.extend(box_details)
+
         progress.progress(1.0, text="Done!")
-        df_all = pd.DataFrame(all_results).sort_values("fid")
+        st.session_state["batch_all_results"]   = all_results
+        st.session_state["batch_all_box_details"] = all_box_details
+
+    if "batch_all_results" in st.session_state:
+        df_all      = pd.DataFrame(st.session_state["batch_all_results"]).sort_values("fid")
+        df_all_boxes = pd.DataFrame(st.session_state["batch_all_box_details"])
 
         st.subheader("2️⃣ Detection summary — All areas")
         m1, m2, m3 = st.columns(3)
@@ -480,6 +582,15 @@ else:
         st.pyplot(fig)
         plt.close(fig)
 
+        # ── Box size analysis across all areas ────────────────
+        if not df_all_boxes.empty:
+            st.subheader("📏 Bounding box size analysis — All areas")
+            st.markdown(
+                "Box size statistics aggregated across all 20 areas. "
+                "Outliers are removed using the IQR method."
+            )
+            box_size_analysis_with_outlier_filter(df_all_boxes, key_prefix="batch")
+
         st.subheader("4️⃣ Field map heatmap")
         st.markdown("Arrange FIDs to match your field layout.")
 
@@ -496,7 +607,7 @@ else:
         try:
             layout_rows = layout_text.strip().split("\n")
             max_cols = max(len(row.split(",")) for row in layout_rows)
-            grid_data = np.zeros((len(layout_rows), max_cols), dtype=int)
+            grid_data   = np.zeros((len(layout_rows), max_cols), dtype=int)
             grid_labels = np.full((len(layout_rows), max_cols), "", dtype=object)
             fid_to_count = dict(zip(df_all["fid"], df_all["total_count"]))
 
